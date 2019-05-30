@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import os.path
 import matplotlib as mpl
-
 import platform
 if os.environ.get('DLClight', default=False) == 'True':
     mpl.use('AGG') #anti-grain geometry engine #https://matplotlib.org/faq/usage_faq.html
@@ -22,7 +21,8 @@ else:
     mpl.use('TkAgg')
 import matplotlib.pyplot as plt
 
-
+from tqdm import tqdm
+from PIL import Image
 
 #if os.environ.get('DLClight', default=False) == 'True':
 #    mpl.use('AGG') #anti-grain geometry engine #https://matplotlib.org/faq/usage_faq.html
@@ -332,7 +332,7 @@ def MakeTest_pose_yaml(dictionary, keys2save, saveasfile):
     with open(saveasfile, "w") as f:
         yaml.dump(dict_test, f)
 
-def merge_annotateddatasets(cfg,project_path,trainingsetfolder_full,windows2linux):
+def merge_annotateddatasets(cfg,project_path,trainingsetfolder_full,windows2linux, video_set=None):
     """
     Merges all the h5 files for all labeled-datasets (from individual videos).
     This is a bit of a mess because of cross platform compatablity. 
@@ -341,7 +341,10 @@ def merge_annotateddatasets(cfg,project_path,trainingsetfolder_full,windows2linu
     """
     AnnotationData=None
     data_path = Path(os.path.join(project_path , 'labeled-data'))
-    videos = cfg['video_sets'].keys()
+    if video_set is None:
+        videos = cfg['video_sets'].keys()
+    else:
+        videos = video_set
     video_names = [Path(i).stem for i in videos]
     for i in video_names:
         try:
@@ -547,6 +550,7 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=Fa
         print("Downloading the pretrained model (ResNets)....")
         subprocess.call("download.sh", shell=True)
         os.chdir(start)
+        print('finished download')
 
     if Shuffles==None:
         Shuffles=range(1,num_shuffles+1,1)
@@ -570,27 +574,27 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=Fa
             ####################################################
 
             # Make training file!
-            data = []
-            for jj in trainIndexes:
+            def process(jj):
                 H = {}
                 # load image to get dimensions:
                 filename = Data.index[jj]
-                im = io.imread(os.path.join(cfg['project_path'],filename))
+                im = Image.open(os.path.join(cfg['project_path'],filename))
+                width, height = im.width, im.height
+                # im = io.imread(os.path.join(cfg['project_path'],filename))
                 H['image'] = filename
-
-                if np.ndim(im)==3:
+                if im.mode=='RGB':
                     H['size'] = np.array(
-                        [np.shape(im)[2],
-                         np.shape(im)[0],
-                         np.shape(im)[1]])
+                        [3,
+                         height,
+                         width])
                 else:
                     # print "Grayscale!"
-                    H['size'] = np.array([1, np.shape(im)[0], np.shape(im)[1]])
+                    H['size'] = np.array([1, height, width])
 
                 indexjoints=0
                 joints=np.zeros((len(bodyparts),3))*np.nan
                 for bpindex,bodypart in enumerate(bodyparts):
-                    if Data[bodypart]['x'][jj]<np.shape(im)[1] and Data[bodypart]['y'][jj]<np.shape(im)[0]: #are labels in image?
+                    if Data[bodypart]['x'][jj]<width and Data[bodypart]['y'][jj]<height: #are labels in image?
                         joints[indexjoints,0]=int(bpindex)
                         joints[indexjoints,1]=Data[bodypart]['x'][jj]
                         joints[indexjoints,2]=Data[bodypart]['y'][jj]
@@ -600,14 +604,20 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=Fa
                     np.prod(np.isfinite(joints),
                             1))[0], :]  # drop NaN, i.e. lines for missing body parts
 
-                assert (np.prod(np.array(joints[:, 2]) < np.shape(im)[0])
+                assert (np.prod(np.array(joints[:, 2]) < height)
                         )  # y coordinate within image?
-                assert (np.prod(np.array(joints[:, 1]) < np.shape(im)[1])
+                assert (np.prod(np.array(joints[:, 1]) < width)
                         )  # x coordinate within image?
 
                 H['joints'] = np.array(joints, dtype=int)
                 if np.size(joints)>0: #exclude images without labels
-                        data.append(H)
+                    return H
+                else:
+                    return None
+
+            # p = ThreadPool(2)
+            data = [process(jj) for jj in tqdm(trainIndexes)]
+            data = [x for x in data if x is not None]
 
             if len(trainIndexes)>0:
                 datafilename,metadatafilename=auxiliaryfunctions.GetDataandMetaDataFilenames(trainingsetfolder,trainFraction,shuffle,cfg)
@@ -664,3 +674,212 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=Fa
                 ]
                 MakeTest_pose_yaml(trainingdata, keys2save,path_test_config)
                 print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")
+
+def create_multiview_training_dataset(config,videos, num_shuffles=1,Shuffles=None,windows2linux=False,trainIndices=None,testIndices=None):
+    """
+    Creates a training dataset. Labels from all the extracted frames are merged into a single .h5 file.\n
+    Only the videos included in the config file are used to create this dataset.\n
+    
+    [OPTIONAL] Use the function 'add_new_video' at any stage of the project to add more videos to the project.
+
+    Parameter
+    ----------
+    config : string
+        Full path of the config.yaml file as a string.
+
+    videos : list of strings
+        Each video pertains to a different view
+
+    num_shuffles : int, optional
+        Number of shuffles of training dataset to create, i.e. [1,2,3] for num_shuffles=3. Default is set to 1.
+
+    Shuffles: list of shuffles.
+        Alternatively the user can also give a list of shuffles (integers!).
+
+    windows2linux: bool.
+        The annotation files contain path formated according to your operating system. If you label on windows 
+        but train & evaluate on a unix system (e.g. ubunt, colab, Mac) set this variable to True to convert the paths. 
+    
+    trainIndices and testIndices: list of indices for traininng and testing. Use mergeandsplit(config,trainindex=0,uniform=True,windows2linux=False) to create them
+    See help for deeplabcut.mergeandsplit?
+    
+    Example
+    --------
+    >>> deeplabcut.create_training_dataset('/analysis/project/reaching-task/config.yaml',num_shuffles=1)
+    Windows:
+    >>> deeplabcut.create_training_dataset('C:\\Users\\Ulf\\looming-task\\config.yaml',Shuffles=[3,17,5])
+    --------
+    """
+    from skimage import io
+    import scipy.io as sio
+    import deeplabcut
+    import subprocess
+    from multiprocessing import Process
+
+    # Loading metadata from config file:
+    cfg = auxiliaryfunctions.read_config(config)
+    scorer = cfg['scorer']
+    project_path = cfg['project_path']
+    # Create path for training sets & store data there
+    trainingsetfolder = auxiliaryfunctions.GetTrainingSetFolder(cfg) #Path concatenation OS platform independent
+    auxiliaryfunctions.attempttomakefolder(Path(os.path.join(project_path,str(trainingsetfolder))),recursive=True)
+    
+    Datas = []
+    for video in videos:
+        Data = merge_annotateddatasets(cfg,project_path,Path(os.path.join(project_path,trainingsetfolder)),windows2linux, video_set=[video])
+        Datas.append(Data[scorer]) #extract labeled data
+
+    #set model type. we will allow more in the future.
+    if cfg['resnet']==50:
+        net_type ='resnet_'+str(cfg['resnet'])
+        resnet_path = str(Path(deeplabcut.__file__).parents[0] / 'pose_estimation_tensorflow/models/pretrained/resnet_v1_50.ckpt')
+    elif cfg['resnet']==101:
+        net_type ='resnet_'+str(cfg['resnet'])
+        resnet_path = str(Path(deeplabcut.__file__).parents[0] / 'pose_estimation_tensorflow/models/pretrained/resnet_v1_101.ckpt')
+    else:
+        print("Currently only ResNet 50 or 101 supported, please change 'resnet' entry in config.yaml!")
+        num_shuffles=-1 #thus the loop below is empty...
+
+    if not Path(resnet_path).is_file():
+        """
+        Downloads the ImageNet pretrained weights for ResNet.
+        """
+        start = os.getcwd()
+        os.chdir(str(Path(resnet_path).parents[0]))
+        print("Downloading the pretrained model (ResNets)....")
+        subprocess.call("download.sh", shell=True)
+        os.chdir(start)
+        print('finished download')
+
+    if Shuffles==None:
+        Shuffles=range(1,num_shuffles+1,1)
+    else:
+        Shuffles=[i for i in Shuffles if isinstance(i,int)]
+
+    bodyparts = cfg['bodyparts']
+    TrainingFraction = cfg['TrainingFraction']
+    for shuffle in Shuffles: # Creating shuffles starting from 1
+        for trainFraction in TrainingFraction:
+            #trainIndexes, testIndexes = SplitTrials(range(len(Data.index)), trainFraction)
+            if trainIndices is None and testIndices is None:
+                trainIndexes, testIndexes = SplitTrials(range(len(Datas[0].index)), trainFraction)
+            else: # set to passed values...
+                trainIndexes=trainIndices
+                testIndexes=testIndices
+                print("You passed a split with the following fraction:", len(trainIndexes)*1./(len(testIndexes)+len(trainIndexes))*100)
+            
+            ####################################################
+            # Generating data structure with labeled information & frame metadata (for deep cut)
+            ####################################################
+            for i, video in enumerate(videos):
+                continue
+                Data = Datas[i]
+                # Make training file!
+                def process(jj):
+                    H = {}
+                    # load image to get dimensions:
+                    filename = Data.index[jj]
+                    im = Image.open(os.path.join(cfg['project_path'],filename))
+                    width, height = im.width, im.height
+                    # im = io.imread(os.path.join(cfg['project_path'],filename))
+                    H['image'] = filename
+                    if im.mode=='RGB':
+                        H['size'] = np.array(
+                            [3,
+                             height,
+                             width])
+                    else:
+                        # print "Grayscale!"
+                        H['size'] = np.array([1, height, width])
+
+                    indexjoints=0
+                    joints=np.zeros((len(bodyparts),3))*np.nan
+                    for bpindex,bodypart in enumerate(bodyparts):
+                        if Data[bodypart]['x'][jj]<width and Data[bodypart]['y'][jj]<height: #are labels in image?
+                            joints[indexjoints,0]=int(bpindex)
+                            joints[indexjoints,1]=Data[bodypart]['x'][jj]
+                            joints[indexjoints,2]=Data[bodypart]['y'][jj]
+                            indexjoints+=1
+
+                    joints = joints[np.where(
+                        np.prod(np.isfinite(joints),
+                                1))[0], :]  # drop NaN, i.e. lines for missing body parts
+
+                    assert (np.prod(np.array(joints[:, 2]) < height)
+                            )  # y coordinate within image?
+                    assert (np.prod(np.array(joints[:, 1]) < width)
+                            )  # x coordinate within image?
+
+                    H['joints'] = np.array(joints, dtype=int)
+                    if np.size(joints)>0: #exclude images without labels
+                        return H
+                    else:
+                        return None
+
+                # p = ThreadPool(2)
+                data = [process(jj) for jj in tqdm(trainIndexes)]
+                data = [x for x in data if x is not None]
+
+                if len(trainIndexes)>0:
+                    datafilename,metadatafilename=auxiliaryfunctions.GetDataandMetaDataFilenames(trainingsetfolder,trainFraction,shuffle,cfg)
+                    parts=os.path.splitext(datafilename)
+                    datafilename=parts[0]+'-'+video+parts[1]
+                    parts=os.path.splitext(metadatafilename)
+                    metadatafilename=parts[0]+'-'+video+parts[1]
+                    ################################################################################
+                    # Saving metadata (Pickle file)
+                    ################################################################################
+                    auxiliaryfunctions.SaveMetadata(os.path.join(project_path,metadatafilename),data, trainIndexes, testIndexes, trainFraction)
+                    ################################################################################
+                    # Saving data file (convert to training file for deeper cut (*.mat))
+                    ################################################################################
+
+                    DTYPE = [('image', 'O'), ('size', 'O'), ('joints', 'O')]
+                    MatlabData = np.array(
+                        [(np.array([data[item]['image']], dtype='U'),
+                          np.array([data[item]['size']]),
+                          boxitintoacell(data[item]['joints']))
+                         for item in range(len(data))],
+                        dtype=DTYPE)
+
+                    sio.savemat(os.path.join(project_path,datafilename), {'dataset': MatlabData})
+
+            ################################################################################
+            # Creating file structure for training &
+            # Test files as well as pose_yaml files (containing training and testing information)
+            #################################################################################
+
+            modelfoldername=auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)
+            auxiliaryfunctions.attempttomakefolder(Path(config).parents[0] / modelfoldername,recursive=True)
+            auxiliaryfunctions.attempttomakefolder(str(Path(config).parents[0] / modelfoldername)+ '/'+ '/train')
+            auxiliaryfunctions.attempttomakefolder(str(Path(config).parents[0] / modelfoldername)+ '/'+ '/test')
+
+            path_train_config = str(os.path.join(cfg['project_path'],Path(modelfoldername),'train','pose_cfg.yaml'))
+            path_test_config = str(os.path.join(cfg['project_path'],Path(modelfoldername),'test','pose_cfg.yaml'))
+            #str(cfg['proj_path']+'/'+Path(modelfoldername) / 'test'  /  'pose_cfg.yaml')
+
+            datafilename,metadatafilename=auxiliaryfunctions.GetDataandMetaDataFilenames(trainingsetfolder,trainFraction,shuffle,cfg)
+            parts = os.path.splitext(datafilename)
+            items2change = {
+                "dataset": datafilename,
+                "metadataset": metadatafilename,
+                "multiview_datasets": [parts[0]+'-'+video+parts[1] for video in videos],
+                "num_views": len(videos),
+                "num_joints": len(bodyparts),
+                "all_joints": [[i] for i in range(len(bodyparts))],
+                "all_joints_names": [str(bpt) for bpt in bodyparts],
+                "init_weights": resnet_path,
+                "project_path": str(cfg['project_path']),
+                "net_type": net_type
+            }
+
+            defaultconfigfile = str(Path(deeplabcut.__file__).parents[0] / 'pose_cfg.yaml')
+
+            trainingdata = MakeTrain_pose_yaml(items2change,path_train_config,defaultconfigfile)
+            keys2save = [
+                "dataset", "multiview_datasets", "num_views", "num_joints", "all_joints", "all_joints_names",
+                "net_type", 'init_weights', 'global_scale', 'location_refinement',
+                'locref_stdev'
+            ]
+            MakeTest_pose_yaml(trainingdata, keys2save,path_test_config)
+            print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")

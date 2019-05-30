@@ -85,3 +85,8 @@ display_iters: 1000
 # How often to save training snapshot
 save_iters: 50000
 
+# number of views
+num_views: 1
+# list of paths to datasets constructed from each view (similar paths to those found in 'dataset' parameter)
+multiview_datasets: []
+

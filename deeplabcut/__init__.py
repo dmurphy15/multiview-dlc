@@ -43,7 +43,7 @@ from deeplabcut import pose_estimation_tensorflow
 from deeplabcut import utils
 from deeplabcut.create_project import create_new_project, add_new_videos, load_demo_data
 from deeplabcut.generate_training_dataset import extract_frames
-from deeplabcut.generate_training_dataset import check_labels,create_training_dataset, mergeandsplit
+from deeplabcut.generate_training_dataset import check_labels,create_training_dataset,mergeandsplit,create_multiview_training_dataset
 
 if os.environ.get('Colab', default=False) == 'True':
     print("Project loaded in colab-mode. Apparently Colab has trouble loading statsmodels, so the smooting & outlier frame extraction is disabled. Sorry!")
