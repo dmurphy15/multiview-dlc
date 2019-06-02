@@ -9,7 +9,21 @@ M Mathis, mackenzie@post.harvard.edu
 import os
 from pathlib import Path
 
-def train_network(config,shuffle=1,trainingsetindex=0,gputouse=None,max_snapshots_to_keep=5,autotune=False,displayiters=None,saveiters=None,maxiters=None):
+def train_multiview_network_step_1(config,projection_matrices,shuffle=1,trainingsetindex=0,gputouse=None,max_snapshots_to_keep=5,autotune=False,displayiters=None,saveiters=None,maxiters=None):
+    """
+    use this for the initial training of the multiview network
+    """
+    train_network(config, shuffle, trainingsetindex, gputouse, max_snapshots_to_keep, autotune, displayiters, saveiters, maxiters, projection_matrices, 1)
+
+def train_multiview_network_step_2(config,projection_matrices,snapshot_index,shuffle=1,trainingsetindex=0,gputouse=None,max_snapshots_to_keep=5,autotune=False,displayiters=None,saveiters=None,maxiters=None):
+    """
+    use this for refining the network predictions (via confidence score reweighting)
+    snapshot_index is the index of the snapshot to restore and resume training
+    """
+    train_network(config, shuffle, trainingsetindex, gputouse, max_snapshots_to_keep, autotune, displayiters, saveiters, maxiters, projection_matrices, 2, snapshot_index)
+
+
+def train_network(config,shuffle=1,trainingsetindex=0,gputouse=None,max_snapshots_to_keep=5,autotune=False,displayiters=None,saveiters=None,maxiters=None,projection_matrices=None, multiview_step=None, snapshot_index=None):
     """Trains the network with the labels in the training dataset.
 
     Parameter
@@ -84,7 +98,7 @@ def train_network(config,shuffle=1,trainingsetindex=0,gputouse=None,max_snapshot
 
 
       try:
-          train(str(poseconfigfile),displayiters,saveiters,maxiters,max_to_keep=max_snapshots_to_keep) #pass on path and file name for pose_cfg.yaml!
+          train(str(poseconfigfile),displayiters,saveiters,maxiters,max_to_keep=max_snapshots_to_keep, projection_matrices=projection_matrices, multiview_step=multiview_step, snapshot_index=snapshot_index) #pass on path and file name for pose_cfg.yaml!
       except BaseException as e:
           raise e
       finally:

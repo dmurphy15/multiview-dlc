@@ -75,13 +75,16 @@ def get_optimizer(loss_op, cfg):
 
 	return learning_rate, train_op
 
-def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
+def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5, projection_matrices=None, multiview_step=None, snapshot_index=None):
 	start_path=os.getcwd()
 	os.chdir(str(Path(config_yaml).parents[0])) #switch to folder of config_yaml (for logging)
 	setup_logging()
 	
 	cfg = load_config(config_yaml)
 	cfg['batch_size']=1 #in case this was edited for analysis.
+
+	cfg['projection_matrices'] = projection_matrices
+	cfg['multiview_step'] = multiview_step
 	
 	dataset = create_dataset(cfg)
 	batch_spec = get_batch_spec(cfg)
@@ -93,7 +96,12 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
 		tf.summary.scalar(k, t)
 	merged_summaries = tf.summary.merge_all()
 
-	variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
+	if snapshot_index is None:
+		variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
+	else:
+		variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"], exclude=[op.name for op in tf.global_variables(scope='.*reweighting.*')])
+		cfg.init_weights = os.path.join(os.path.dirname(config_yaml), 'snapshot-%d'%snapshot_index)
+		
 	restorer = tf.train.Saver(variables_to_restore)
 	saver = tf.train.Saver(max_to_keep=max_to_keep) # selects how many snapshots are stored, see https://github.com/AlexEMG/DeepLabCut/issues/8#issuecomment-387404835
 

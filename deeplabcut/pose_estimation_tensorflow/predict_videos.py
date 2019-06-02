@@ -558,6 +558,242 @@ def analyze_time_lapse_frames(config,directory,frametype='.png',shuffle=1,traini
                 print("No frames were found. Consider changing the path or the frametype.")
     
     os.chdir(str(start_path))
+
+def analyze_videos_multiview(config, videos, projection_matrices, output_folder, make_labeled_video=True, shuffle=1,trainingsetindex=0):
+    """
+    videos: list of strings
+        each string is the path to a video. Each video should pertain to a different view
+
+    projection_matrices: list of matrices
+        each projection matrix is a 3x4 numpy array
+
+    output_folder: string
+        a path to a folder in which to write output
+
+    make_labeled_video: bool, optional
+        if True, make a video out of the labeled frames and write it to output_folder
+    """
+    import matplotlib
+    matplotlib.use('Agg') 
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    from threading import Thread, Lock
+    from queue import Queue
+
+    if 'TF_CUDNN_USE_AUTOTUNE' in os.environ:
+        del os.environ['TF_CUDNN_USE_AUTOTUNE'] #was potentially set during training
+            
+    tf.reset_default_graph()
+    start_path=os.getcwd() #record cwd to return to this directory in the end
+    
+    cfg = auxiliaryfunctions.read_config(config)
+        
+    trainFraction = cfg['TrainingFraction'][trainingsetindex]
+    
+    modelfolder=os.path.join(cfg["project_path"],str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
+    path_test_config = Path(modelfolder) / 'test' / 'pose_cfg.yaml'
+    try:
+        dlc_cfg = load_config(str(path_test_config))
+    except FileNotFoundError:
+        raise FileNotFoundError("It seems the model for shuffle %s and trainFraction %s does not exist."%(shuffle,trainFraction))
+
+    # Check which snapshots are available and sort them by # iterations
+    try:
+      Snapshots = np.array([fn.split('.')[0]for fn in os.listdir(os.path.join(modelfolder , 'train'))if "index" in fn])
+    except FileNotFoundError:
+      raise FileNotFoundError("Snapshots not found! It seems the dataset for shuffle %s has not been trained/does not exist.\n Please train it before using it to analyze videos.\n Use the function 'train_network' to train the network for shuffle %s."%(shuffle,shuffle))
+
+    if cfg['snapshotindex'] == 'all':
+        print("Snapshotindex is set to 'all' in the config.yaml file. Running video analysis with all snapshots is very costly! Use the function 'evaluate_network' to choose the best the snapshot. For now, changing snapshot index to -1!")
+        snapshotindex = -1
+    else:
+        snapshotindex=cfg['snapshotindex']
+        
+    increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
+    Snapshots = Snapshots[increasing_indices]
+    
+    print("Using %s" % Snapshots[snapshotindex], "for model", modelfolder)
+
+    ##################################################
+    # Load and setup CNN part detector
+    ##################################################
+
+    # Check if data already was generated:
+    dlc_cfg['init_weights'] = os.path.join(modelfolder , 'train', Snapshots[snapshotindex])
+    trainingsiterations = (dlc_cfg['init_weights'].split(os.sep)[-1]).split('-')[-1]
+    
+    dlc_cfg['batch_size']=1
+    # Name for scorer:
+    DLCscorer = auxiliaryfunctions.GetScorerName(cfg,shuffle,trainFraction,trainingsiterations=trainingsiterations)
+    
+    sess, inputs, outputs = predict.setup_pose_prediction(dlc_cfg)
+
+    caps = [cv2.VideoCapture(video) for video in videos]
+    for cap in caps:
+        fps = cap.get(5) #https://docs.opencv.org/2.4/modules/highgui/doc/reading_and_writing_images_and_video.html#videocapture-get
+        nframes = int(cap.get(7))
+        duration=nframes*1./fps
+        size=(int(cap.get(4)),int(cap.get(3)))
+        
+    ny,nx=size
+    print("Duration of video [s]: ", round(duration,2), ", recorded with ", round(fps,2),"fps!")
+    print("Overall # of frames: ", nframes," found with (before cropping) frame dimensions: ", nx,ny)
+    start = time.time()
+
+    print('Extracting pose')
+    qs = [Queue(maxsize=128) for _ in caps]
+    q = Queue(maxsize=128)
+    def extract_one(cap, q):
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if ret:
+                # frame = cv2.resize(frame, (482, 256))
+                q.put(frame)
+            else:
+                break
+        q.put(None)
+    def extract_all(q):
+        while True:
+            res = [qq.get() for qq in qs]
+            if any([frame is None for frame in res]):
+                q.put(None)
+                break
+            q.put(res)
+    ts = [Thread(target=extract_one, args=z) for z in zip(caps, qs)]
+    t = Thread(target=extract_all, args=(q,))
+    for tt in ts:
+        tt.start()
+    t.start()
+
+    poses = []
+    counter = 0
+    for _ in tqdm(range(nframes)):
+        frames = q.get()
+        if frames is not None:
+            frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
+            frames = [img_as_ubyte(frame) for frame in frames]
+            out = sess.run(outputs, feed_dict={inputs: frames})
+            scmap, locref = predict.extract_cnn_output(out, dlc_cfg)
+            pose = predict.argmax_pose_predict(scmap, locref, dlc_cfg.stride)
+            poses.append(pose)
+        else:
+            nframes=counter
+            break
+        counter+=1
+
+    print('Extracted pose for %d frames'%nframes)
+
+    poses = np.array(poses) # nframes x num_views x num_joints x 3
+    num_views = poses.shape[1]
+    results = poses.reshape([nframes, -1])
+    pdindex = pd.MultiIndex.from_product([[DLCscorer], ['view_%d'%i for i in range(poses.shape[1])], dlc_cfg['all_joints_names'], ['x', 'y', 'likelihood']],names=['scorer', 'views', 'bodyparts', 'coords'])
+    results = pd.DataFrame(data=results, columns=pdindex)
+    results.to_hdf(os.path.join(output_folder, '2dposes.h5'), key='results')
+    results.to_csv(os.path.join(output_folder, '2dposes.csv'))
+
+    poses = np.transpose(poses, [0, 2, 1, 3]).reshape([-1, num_views, 3])# / [[[482, 256, 1]]] 
+    scores = np.copy(poses[:,:,2])
+    poses[:,:,2] = 1
+    preds3d = project_3d(projection_matrices, poses, confidences=scores)
+    preds3d[~np.isfinite(preds3d)] = 0
+    preds3d = preds3d.reshape([nframes, -1])
+    pdindex = pd.MultiIndex.from_product([[DLCscorer], dlc_cfg['all_joints_names'], ['x', 'y', 'z']], names=['scorer', 'bodyparts', 'coords'])
+    results = pd.DataFrame(preds3d, columns=pdindex)
+    results.to_hdf(os.path.join(output_folder, '3dposes.h5'), key='results')
+    results.to_csv(os.path.join(output_folder, '3dposes.csv'))
+
+    if make_labeled_video:
+        print('making 3d video')
+        preds3d = preds3d.reshape([nframes, -1, 3])[:,:12]
+        fig = plt.figure()
+        ax = Axes3D(fig)
+        bounds = [
+            [np.min(preds3d[:,:,0]), np.max(preds3d[:,:,0])],
+            [np.min(preds3d[:,:,1]), np.max(preds3d[:,:,1])],
+            [np.min(preds3d[:,:,2]), np.max(preds3d[:,:,2])]
+        ]
+
+        codec = 'mp4v'
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        svid = cv2.VideoWriter(os.path.join(output_folder, '3dvideoresults.mp4'), fourcc, fps, fig.canvas.get_width_height(), True)
+
+        for im_idx in tqdm(range(preds3d.shape[0])):
+            pose_pred = preds3d[im_idx] # num_joints x (x,y,z)
+            ax.scatter(pose_pred[:,0], pose_pred[:,1], pose_pred[:,2], cmap='cool')
+            ax.set_xlim(bounds[0][0], bounds[0][1])
+            ax.set_ylim(bounds[1][0], bounds[1][1])
+            ax.set_zlim(bounds[2][0], bounds[2][1])
+
+            fig.canvas.draw()
+            data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+            data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            ax.clear()
+            svid.write(np.flip(data,2)) 
+        svid.release()
+
+# solve linear system to get 3D coordinates
+# helpful explanation of equation found on pg 5 here: https://hal.inria.fr/inria-00524401/PDF/Sturm-cvpr05.pdf
+# projection_matrices is a list, predictions is an array of shape n x num_views x 3
+# confidences is n x num_views
+def project_3d(projection_matrices, predictions, confidences=None):
+    n, num_views = predictions.shape[:2]
+    A1 = np.tile(np.vstack(projection_matrices)[None], [n, 1, 1])
+    A2 = np.zeros([n, 3*num_views, num_views])
+    A = np.concatenate([A1, A2], axis=2).astype(np.float)
+    if confidences is not None:
+        A[:,:,:4] *= np.repeat(confidences, 3, axis=1)[:,:,None]
+        predictions = np.copy(predictions) * confidences[:,:,None]
+    updates_rows = np.arange(3*num_views)
+    updates_cols = np.repeat(np.arange(num_views)+4, 3)
+    A[:,updates_rows, updates_cols] = -1*predictions.reshape([n, num_views*3])
+    u, s, vh = np.linalg.svd(A)
+    preds3d = vh[:,-1] # bottom row of V^T is eigenvector of smallest singular value
+    preds3d = preds3d[:,:3] / preds3d[:,3,None]
+    return preds3d
+
+
+def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,DLCscorer,bodyparts2plot,cropping,x1,x2,y1,y2):
+        ''' Creating individual frames with labeled body parts and making a video'''
+        colorclass=plt.cm.ScalarMappable(cmap=colormap)
+        C=colorclass.to_rgba(np.linspace(0,1,len(bodyparts2plot)))
+        colors=(C[:,:3]*255).astype(np.uint8)
+        if cropping:
+            ny, nx= y2-y1,x2-x1
+        else:
+            ny, nx= clip.height(), clip.width()
+        fps=clip.fps()
+        nframes = len(Dataframe.index)
+        duration = nframes/fps
+
+        print("Duration of video [s]: ", round(duration,2), ", recorded with ", round(fps,2),"fps!")
+        print("Overall # of frames: ", nframes, "with cropped frame dimensions: ",nx,ny)
+
+        print("Generating frames and creating video.")
+        df_likelihood = np.empty((len(bodyparts2plot),nframes))
+        df_x = np.empty((len(bodyparts2plot),nframes))
+        df_y = np.empty((len(bodyparts2plot),nframes))
+        for bpindex, bp in enumerate(bodyparts2plot):
+            df_likelihood[bpindex,:]=Dataframe[DLCscorer][bp]['likelihood'].values
+            df_x[bpindex,:]=Dataframe[DLCscorer][bp]['x'].values
+            df_y[bpindex,:]=Dataframe[DLCscorer][bp]['y'].values
+        
+        for index in tqdm(range(nframes)):
+            image = clip.load_frame()
+            if cropping:
+                    image=image[y1:y2,x1:x2]
+            else:
+                pass
+            for bpindex in range(len(bodyparts2plot)):
+                if df_likelihood[bpindex,index] > pcutoff:
+                    xc = int(df_x[bpindex,index])
+                    yc = int(df_y[bpindex,index])
+                    #rr, cc = circle_perimeter(yc,xc,radius)
+                    rr, cc = circle(yc,xc,dotsize,shape=(ny,nx))
+                    image[rr, cc, :] = colors[bpindex]
+
+            frame = image
+            clip.save_frame(frame)
+        clip.close()
     
 
 if __name__ == '__main__':

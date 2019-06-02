@@ -24,7 +24,7 @@ class Batch(Enum):
 	locref_targets = 3
 	locref_mask = 4
 	data_item = 5
-
+	labels_3d = 6
 
 def mirror_joints_map(all_joints, num_joints):
 	res = np.arange(num_joints)
@@ -86,11 +86,11 @@ class MultiViewPoseDataset(PoseDataset):
 			cfg2.dataset = dataset
 			self.singleViewDatasets.append(SingleViewPoseDataset(cfg2))
 		self.curr_img = 0
-		num_images = self.singleViewDatasets[0].num_images
+		self.num_images = self.singleViewDatasets[0].num_images
 		if cfg.shuffle:
-			self.image_indices = np.random.permutation(num_images)
+			self.image_indices = np.random.permutation(self.num_images)
 		else:
-			self.image_indices = np.arange(num_images)
+			self.image_indices = np.arange(self.num_images)
 
 	def get_scale(self):
 		cfg = self.cfg
@@ -102,12 +102,43 @@ class MultiViewPoseDataset(PoseDataset):
 
 	def next_batch(self):
 		index = self.image_indices[self.curr_img]
-		self.curr_img += 1
+		self.curr_img = (self.curr_img + 1) % self.num_images
 		scale = self.get_scale() 
 		batches = [dataset.get_batch(index, scale) for dataset in self.singleViewDatasets]
 		keys = batches[0].keys()
-		batches = { key: np.concatenate([batch[key] for batch in batches], axis=0) for key in keys if key is not Batch.data_item}
-		return batches
+		batches2 = { key: np.concatenate([batch[key] for batch in batches], axis=0) for key in keys if key is not Batch.data_item}
+		full_2d_labels = np.zeros([self.cfg.num_views, self.cfg.num_joints, 3]) # this will hold (x,y,present) where present is 1 if the label is there, and 0 if the joint wasn't labeled for this view/frame
+		for i, batch in enumerate(batches):
+			joints = batch[Batch.data_item].joints[0] # n x 3; first col is joint index, next two are x,y coords
+			full_2d_labels[i, joints[:,0]] = np.concatenate([joints[:,1:], np.ones([joints.shape[0], 1])], axis=1)
+		full_2d_labels2 = np.transpose(full_2d_labels, [1, 0, 2])
+		scores = full_2d_labels2[:,:,2]
+		labels_3d = project_3d(self.cfg.projection_matrices, full_2d_labels2, scores)
+		valid = np.sum(scores, axis=1)>1
+		labels_3d[~valid] = 0
+		labels_3d = np.concatenate([labels_3d, valid[:,None]], axis=1) # num_joints x (x,y,z,valid)
+		batches2[Batch.labels_3d] = [labels_3d]*self.cfg.num_views 
+		return batches2
+
+# solve linear system to get 3D coordinates
+# helpful explanation of equation found on pg 5 here: https://hal.inria.fr/inria-00524401/PDF/Sturm-cvpr05.pdf
+# projection_matrices is a list, predictions is an array of shape n x num_views x 3
+# confidences is n x num_views
+def project_3d(projection_matrices, predictions, confidences=None):
+    n, num_views = predictions.shape[:2]
+    A1 = np.tile(np.vstack(projection_matrices)[None], [n, 1, 1])
+    A2 = np.zeros([n, 3*num_views, num_views])
+    A = np.concatenate([A1, A2], axis=2).astype(np.float)
+    if confidences is not None:
+        A[:,:,:4] *= np.repeat(confidences, 3, axis=1)[:,:,None]
+        predictions = np.copy(predictions) * confidences[:,:,None]
+    updates_rows = np.arange(3*num_views)
+    updates_cols = np.repeat(np.arange(num_views)+4, 3)
+    A[:,updates_rows, updates_cols] = -1*predictions.reshape([n, num_views*3])
+    u, s, vh = np.linalg.svd(A)
+    preds3d = vh[:,-1] # bottom row of V^T is eigenvector of smallest singular value
+    preds3d = preds3d[:,:3] / preds3d[:,3,None]
+    return preds3d
 
 
 class SingleViewPoseDataset(PoseDataset):

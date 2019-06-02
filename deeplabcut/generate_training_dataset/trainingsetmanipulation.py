@@ -772,7 +772,6 @@ def create_multiview_training_dataset(config,videos, num_shuffles=1,Shuffles=Non
             # Generating data structure with labeled information & frame metadata (for deep cut)
             ####################################################
             for i, video in enumerate(videos):
-                continue
                 Data = Datas[i]
                 # Make training file!
                 def process(jj):
