@@ -85,6 +85,16 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5, projection_
 
 	cfg['projection_matrices'] = projection_matrices
 	cfg['multiview_step'] = multiview_step
+	# at this step, jittering the image sizes won't help
+	# also, if we jitter the sizes then we would have to undo the jitter before projecting to 3D, so we may as well keep the image size constant
+	if multiview_step == 2:
+		cfg.global_scale = 1.0
+		cfg.scale_jitter_lo = 1.0
+		cfg.scale_jitter_up = 1.0
+		# also found best results with this optimizer and lr
+		print('switching to hardcoded Adam optimizer for this step')
+		cfg.optimizer = 'adam'
+		cfg.adam_lr = 0.0001
 	
 	dataset = create_dataset(cfg)
 	batch_spec = get_batch_spec(cfg)
@@ -99,9 +109,9 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5, projection_
 	if snapshot_index is None:
 		variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
 	else:
-		variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"], exclude=[op.name for op in tf.global_variables(scope='.*reweighting.*')])
+		variables_to_restore = slim.get_variables_to_restore(exclude=[op.name for op in tf.global_variables(scope='.*reweighting.*')])
 		cfg.init_weights = os.path.join(os.path.dirname(config_yaml), 'snapshot-%d'%snapshot_index)
-		
+
 	restorer = tf.train.Saver(variables_to_restore)
 	saver = tf.train.Saver(max_to_keep=max_to_keep) # selects how many snapshots are stored, see https://github.com/AlexEMG/DeepLabCut/issues/8#issuecomment-387404835
 

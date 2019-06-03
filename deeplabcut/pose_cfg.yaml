@@ -18,14 +18,14 @@ pos_dist_thresh: 17
 # all images in the dataset will be rescaled by the following
 # scaling factor to be processed by the CNN. You can select the
 # optimal scale by cross-validation
-global_scale: 0.8
+global_scale: 1.0
 
 ##############################################################################
 #### Augmentation variables
 ##############################################################################
 # During training an image will be randomly scaled within the
 # range [scale_jitter_lo; scale_jitter_up] to augment training data,
-scale_jitter_lo: 0.5
+scale_jitter_lo: 0.75
 scale_jitter_up: 1.25
 
 # Randomly flips an image horizontally to augment training data
@@ -81,9 +81,9 @@ multi_step:
 - [0.001, 1030000]
 
 # How often display loss
-display_iters: 1000
+display_iters: 10
 # How often to save training snapshot
-save_iters: 50000
+save_iters: 5000
 
 # number of views
 num_views: 1

@@ -4,6 +4,7 @@ https://github.com/eldar/pose-tensorflow
 '''
 
 import re
+import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 from tensorflow.contrib.slim.nets import resnet_v1
@@ -95,6 +96,27 @@ class PoseNet:
 			if cfg.intermediate_supervision:
 				out['part_pred_interm'] = tf.concat([part_pred_interms[i][j, None] for i in range(cfg.num_views) for j in range(cfg.batch_size)], axis=0)
 
+			if cfg.multiview_step == 2:
+				preds, scores = get_preds(cfg, out['part_pred'], out['locref'])
+				preds = tf.stop_gradient(preds); scores = tf.stop_gradient(scores)
+
+				scores = tf.reshape(scores, [1, cfg.num_views*cfg.num_joints])
+				scores = slim.fully_connected(scores, cfg.num_joints*cfg.num_views,
+					normalizer_fn=slim.batch_norm, activation_fn=tf.nn.relu,
+					weights_initializer=tf.constant_initializer(np.eye(cfg.num_views*cfg.num_joints)),
+					scope='reweighting/1')
+				scores = slim.fully_connected(scores, cfg.num_joints*cfg.num_views,
+					normalizer_fn=slim.batch_norm, activation_fn=None,
+					weights_initializer=tf.constant_initializer(np.eye(cfg.num_views*cfg.num_joints)),
+					scope='reweighting/2')
+				scores = tf.sigmoid(tf.transpose(tf.reshape(scores, [cfg.num_views, cfg.num_joints]))) # reshaping in this way bc the initialization preserves the meaning of each vector element
+
+				preds = tf.transpose(preds, [1, 0, 2]) # num_joints x num_views x (x,y)
+				preds = tf.concat([preds, tf.ones([cfg.num_joints, cfg.num_views, 1])], axis=2)
+				preds_3d = project_3d(cfg, cfg.projection_matrices, preds, scores)
+
+				out['pred_3d'] = preds_3d
+
 		return out
 
 	def get_net(self, inputs):
@@ -103,8 +125,10 @@ class PoseNet:
 
 	def test(self, inputs):
 		heads = self.get_net(inputs)
-		prob = tf.sigmoid(heads['part_pred'])
-		return {'part_prob': prob, 'locref': heads['locref']}
+		# prob = tf.sigmoid(heads['part_pred'])
+		# return {'part_prob': prob, 'locref': heads['locref']}
+		heads['part_prob'] = tf.sigmoid(heads['part_pred'])
+		return heads
 
 	def train(self, batch):
 		cfg = self.cfg
@@ -112,29 +136,15 @@ class PoseNet:
 		heads = self.get_net(batch[Batch.inputs])
 
 		if cfg.multiview_step == 2:
-			preds, scores = get_preds(cfg, heads['part_pred'], heads['locref'])
-			preds = tf.stop_gradient(preds); scores = tf.stop_gradient(scores)
-
-			scores = tf.reshape(scores, [1, cfg.num_views*cfg.num_joints])
-			scores = slim.fully_connected(scores,
-				cfg.num_joints*cfg.num_views,
-				normalizer_fn=slim.batch_norm,
-				activation_fn=tf.nn.relu,
-				scope='reweighting/1')
-			scores = slim.fully_connected(scores,
-				cfg.num_joints*cfg.num_views,
-				normalizer_fn=slim.batch_norm,
-				scope='reweighting/2')
-			scores = tf.sigmoid(tf.reshape(scores, [cfg.num_joints, cfg.num_views]))
-
-			preds = tf.transpose(preds, [1, 0, 2]) # num_joints x num_views x (x,y)
-			preds = tf.concat([preds, tf.ones([cfg.num_joints, cfg.num_views, 1])], axis=2)
-			preds_3d = project_3d(cfg, cfg.projection_matrices, preds, scores)
-
+			preds_3d = heads['pred_3d']
 			loss = {}
+			total_loss = 0
+
 			loss['3d_loss'] = tf.losses.mean_squared_error(batch[Batch.labels_3d][0][:,:3], preds_3d, batch[Batch.labels_3d][0][:,3, None])
-			loss['euclidean_error'] = tf.reduce_mean(tf.reduce_sum((batch[Batch.labels_3d][0][:,:3] - preds_3d)**2, axis=1)**0.5)
-			loss['total_loss'] = loss['3d_loss']
+			loss['euclidean_error'] = tf.reduce_mean(tf.reduce_sum((batch[Batch.labels_3d][0][:12,:3] - preds_3d[:12])**2, axis=1)**0.5)
+			total_loss += loss['3d_loss']
+
+			loss['total_loss'] = total_loss
 			return loss
 
 		weigh_part_predictions = cfg.weigh_part_predictions
@@ -171,17 +181,14 @@ class PoseNet:
 # confidences is n x num_views
 def project_3d(cfg, projection_matrices, predictions, confidences):
     n = tf.shape(predictions)[0]
-    A1 = tf.tile(tf.concat(projection_matrices, axis=0)[None], [n, 1, 1])
-
-    A1 = tf.reshape(tf.tile(confidences[:,:,None], [1, 1, 3]), [n, 3*cfg.num_views])[:,:,None] * tf.cast(A1, tf.float32)
-
+    A1 = tf.cast(tf.tile(tf.concat(projection_matrices, axis=0)[None], [n, 1, 1]), tf.float32)
     A2 = tf.stack(
 	    	[tf.concat([tf.zeros([n, view*3]), predictions[:, view, :], tf.zeros([n, (cfg.num_views-view-1)*3])], axis=1) for view in range(cfg.num_views)],
     	axis=2)
 
-    A = tf.cast(tf.concat([A1, A2], axis=2), tf.float32)
-    
-    predictions = tf.identity(predictions) * confidences[:,:,None]
+    A = tf.concat([A1, A2], axis=2)
+
+    A = A * tf.reshape(tf.tile(confidences[:,:,None], [1,1,3]), [n, 3*cfg.num_views, 1])
 
     s, u, v = tf.linalg.svd(A)
     preds3d = v[:,:,-1] # last column of V is eigenvector of smallest singular value

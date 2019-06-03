@@ -17,6 +17,8 @@ def setup_pose_prediction(cfg):
     outputs = [net_heads['part_prob']]
     if cfg.location_refinement:
         outputs.append(net_heads['locref'])
+    if 'pred_3d' in net_heads:
+        outputs.append(net_heads['pred_3d'])
 
     restorer = tf.train.Saver()
     sess = tf.Session()
