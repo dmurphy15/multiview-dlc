@@ -480,8 +480,7 @@ def evaluate_multiview_network(config,videos,projection_matrices,multiview_step,
                         tail = np.nansum((preds3d_weighted - labels3d)**2, axis=2)**0.5
                         tail = np.sort(tail[~np.isnan(tail)])
                         tail = tail[-10:]
-                        print(tail)
-                        print('tail error: ', np.nanmean(tail))
+                        print('10 worst predictions: ', tail)
 
                         tf.reset_default_graph()
                     elif multiview_step==2:
@@ -517,7 +516,7 @@ def evaluate_multiview_network(config,videos,projection_matrices,multiview_step,
                         labels3d[~valid] = np.nan
                         labels3d = labels3d.reshape([num_ims, num_joints, 3]) 
 
-                        print("\n\n3D errors:")
+                        print("\n\n3D errors (units are determined by projection matrices):")
                         RMSE_train = np.nanmean(np.nansum((preds3d[trainIndices] - labels3d[trainIndices])**2, axis=2)**0.5)
                         RMSE_test = np.nanmean(np.nansum((preds3d[testIndices] - labels3d[testIndices])**2, axis=2)**0.5)
 
@@ -527,8 +526,7 @@ def evaluate_multiview_network(config,videos,projection_matrices,multiview_step,
                         tail = np.nansum((preds3d- labels3d)**2, axis=2)**0.5
                         tail = np.sort(tail[~np.isnan(tail)])
                         tail = tail[-10:]
-                        print(tail)
-                        print('tail error: ', np.nanmean(tail))
+                        print('10 worst predictions: ', tail)
 
                         tf.reset_default_graph()
                     else:

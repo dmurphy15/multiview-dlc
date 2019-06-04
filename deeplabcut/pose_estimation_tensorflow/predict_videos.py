@@ -559,7 +559,7 @@ def analyze_time_lapse_frames(config,directory,frametype='.png',shuffle=1,traini
     
     os.chdir(str(start_path))
 
-def analyze_videos_multiview(config, videos, projection_matrices, output_folder, make_labeled_video=True, shuffle=1,trainingsetindex=0):
+def analyze_videos_multiview(config, videos, projection_matrices, multiview_step, output_folder, snapshot_index=None, make_labeled_video=True, shuffle=1,trainingsetindex=0):
     """
     videos: list of strings
         each string is the path to a video. Each video should pertain to a different view
@@ -567,21 +567,24 @@ def analyze_videos_multiview(config, videos, projection_matrices, output_folder,
     projection_matrices: list of matrices
         each projection matrix is a 3x4 numpy array
 
+    multiview_step: int
+        either 1 or 2, denoting whether network was trained via
+
     output_folder: string
         a path to a folder in which to write output
 
     make_labeled_video: bool, optional
         if True, make a video out of the labeled frames and write it to output_folder
     """
-    import matplotlib
-    matplotlib.use('Agg') 
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     from threading import Thread, Lock
     from queue import Queue
 
     if 'TF_CUDNN_USE_AUTOTUNE' in os.environ:
         del os.environ['TF_CUDNN_USE_AUTOTUNE'] #was potentially set during training
+
+    if multiview_step != 1 and multiview_step != 2:
+        print('multiview_step should be either 1 or 2')
+        return
             
     tf.reset_default_graph()
     start_path=os.getcwd() #record cwd to return to this directory in the end
@@ -597,20 +600,29 @@ def analyze_videos_multiview(config, videos, projection_matrices, output_folder,
     except FileNotFoundError:
         raise FileNotFoundError("It seems the model for shuffle %s and trainFraction %s does not exist."%(shuffle,trainFraction))
 
+    dlc_cfg.multiview_step = multiview_step
+    if multiview_step == 2:
+        dlc_cfg.projection_matrices = projection_matrices
+
     # Check which snapshots are available and sort them by # iterations
     try:
       Snapshots = np.array([fn.split('.')[0]for fn in os.listdir(os.path.join(modelfolder , 'train'))if "index" in fn])
     except FileNotFoundError:
       raise FileNotFoundError("Snapshots not found! It seems the dataset for shuffle %s has not been trained/does not exist.\n Please train it before using it to analyze videos.\n Use the function 'train_network' to train the network for shuffle %s."%(shuffle,shuffle))
 
-    if cfg['snapshotindex'] == 'all':
+    increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
+    Snapshots = Snapshots[increasing_indices]
+
+    if snapshot_index is not None:
+        snapshotindex = -1
+        for i in range(len(Snapshots)):
+            if int(Snapshots[i].split('-')[1].split('.')[0])==snapshot_index:
+                snapshotindex = i
+    elif cfg['snapshotindex'] == 'all':
         print("Snapshotindex is set to 'all' in the config.yaml file. Running video analysis with all snapshots is very costly! Use the function 'evaluate_network' to choose the best the snapshot. For now, changing snapshot index to -1!")
         snapshotindex = -1
     else:
         snapshotindex=cfg['snapshotindex']
-        
-    increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
-    Snapshots = Snapshots[increasing_indices]
     
     print("Using %s" % Snapshots[snapshotindex], "for model", modelfolder)
 
@@ -673,6 +685,9 @@ def analyze_videos_multiview(config, videos, projection_matrices, output_folder,
             frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
             frames = [img_as_ubyte(frame) for frame in frames]
             out = sess.run(outputs, feed_dict={inputs: frames})
+            if multiview_step == 2:
+                poses.append(out[2])
+                continue
             scmap, locref = predict.extract_cnn_output(out, dlc_cfg)
             pose = predict.argmax_pose_predict(scmap, locref, dlc_cfg.stride)
             poses.append(pose)
@@ -683,20 +698,25 @@ def analyze_videos_multiview(config, videos, projection_matrices, output_folder,
 
     print('Extracted pose for %d frames'%nframes)
 
-    poses = np.array(poses) # nframes x num_views x num_joints x 3
-    num_views = poses.shape[1]
-    results = poses.reshape([nframes, -1])
-    pdindex = pd.MultiIndex.from_product([[DLCscorer], ['view_%d'%i for i in range(poses.shape[1])], dlc_cfg['all_joints_names'], ['x', 'y', 'likelihood']],names=['scorer', 'views', 'bodyparts', 'coords'])
-    results = pd.DataFrame(data=results, columns=pdindex)
-    results.to_hdf(os.path.join(output_folder, '2dposes.h5'), key='results')
-    results.to_csv(os.path.join(output_folder, '2dposes.csv'))
+    if multiview_step == 1:
+        poses = np.array(poses) # nframes x num_views x num_joints x 3
+        num_views = poses.shape[1]
+        results = poses.reshape([nframes, -1])
+        pdindex = pd.MultiIndex.from_product([[DLCscorer], ['view_%d'%i for i in range(poses.shape[1])], dlc_cfg['all_joints_names'], ['x', 'y', 'likelihood']],names=['scorer', 'views', 'bodyparts', 'coords'])
+        results = pd.DataFrame(data=results, columns=pdindex)
+        results.to_hdf(os.path.join(output_folder, '2dposes.h5'), key='results')
+        results.to_csv(os.path.join(output_folder, '2dposes.csv'))
 
-    poses = np.transpose(poses, [0, 2, 1, 3]).reshape([-1, num_views, 3])# / [[[482, 256, 1]]] 
-    scores = np.copy(poses[:,:,2])
-    poses[:,:,2] = 1
-    preds3d = project_3d(projection_matrices, poses, confidences=scores)
-    preds3d[~np.isfinite(preds3d)] = 0
-    preds3d = preds3d.reshape([nframes, -1])
+        poses = np.transpose(poses, [0, 2, 1, 3]).reshape([-1, num_views, 3])# / [[[482, 256, 1]]] 
+        scores = np.copy(poses[:,:,2])
+        poses[:,:,2] = 1
+        preds3d = project_3d(projection_matrices, poses, confidences=scores)
+        preds3d[~np.isfinite(preds3d)] = 0
+        preds3d = preds3d.reshape([nframes, -1])
+    elif multiview_step == 2:
+        preds3d = np.array(poses) # nframes x num_joints x 3
+        preds3d = preds3d.reshape([nframes, -1])
+
     pdindex = pd.MultiIndex.from_product([[DLCscorer], dlc_cfg['all_joints_names'], ['x', 'y', 'z']], names=['scorer', 'bodyparts', 'coords'])
     results = pd.DataFrame(preds3d, columns=pdindex)
     results.to_hdf(os.path.join(output_folder, '3dposes.h5'), key='results')
@@ -704,32 +724,39 @@ def analyze_videos_multiview(config, videos, projection_matrices, output_folder,
 
     if make_labeled_video:
         print('making 3d video')
-        preds3d = preds3d.reshape([nframes, -1, 3])[:,:12]
-        fig = plt.figure()
-        ax = Axes3D(fig)
-        bounds = [
-            [np.min(preds3d[:,:,0]), np.max(preds3d[:,:,0])],
-            [np.min(preds3d[:,:,1]), np.max(preds3d[:,:,1])],
-            [np.min(preds3d[:,:,2]), np.max(preds3d[:,:,2])]
-        ]
+        make_3d_labeled_video(preds3d.reshape([nframes, -1, 3]), output_folder)
 
-        codec = 'mp4v'
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        svid = cv2.VideoWriter(os.path.join(output_folder, '3dvideoresults.mp4'), fourcc, fps, fig.canvas.get_width_height(), True)
+# preds3d is num_frames x num_joints x 3
+def make_3d_labeled_video(preds3d, output_folder):
+    import matplotlib
+    matplotlib.use('Agg') 
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
 
-        for im_idx in tqdm(range(preds3d.shape[0])):
-            pose_pred = preds3d[im_idx] # num_joints x (x,y,z)
-            ax.scatter(pose_pred[:,0], pose_pred[:,1], pose_pred[:,2], cmap='cool')
-            ax.set_xlim(bounds[0][0], bounds[0][1])
-            ax.set_ylim(bounds[1][0], bounds[1][1])
-            ax.set_zlim(bounds[2][0], bounds[2][1])
+    fig = plt.figure()
+    ax = Axes3D(fig)
+    bounds = [
+        [np.min(preds3d[:,:,0]), np.max(preds3d[:,:,0])],
+        [np.min(preds3d[:,:,1]), np.max(preds3d[:,:,1])],
+        [np.min(preds3d[:,:,2]), np.max(preds3d[:,:,2])]
+    ]
+    codec = 'mp4v'
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    svid = cv2.VideoWriter(os.path.join(output_folder, '3dvideoresults.mp4'), fourcc, 25, fig.canvas.get_width_height(), True)
 
-            fig.canvas.draw()
-            data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-            data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            ax.clear()
-            svid.write(np.flip(data,2)) 
-        svid.release()
+    for im_idx in tqdm(range(preds3d.shape[0])):
+        pose_pred = preds3d[im_idx] # num_joints x (x,y,z)
+        ax.scatter(pose_pred[:,0], pose_pred[:,1], pose_pred[:,2], cmap='cool')
+        ax.set_xlim(bounds[0][0], bounds[0][1])
+        ax.set_ylim(bounds[1][0], bounds[1][1])
+        ax.set_zlim(bounds[2][0], bounds[2][1])
+
+        fig.canvas.draw()
+        data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        ax.clear()
+        svid.write(np.flip(data,2)) 
+    svid.release()
 
 # solve linear system to get 3D coordinates
 # helpful explanation of equation found on pg 5 here: https://hal.inria.fr/inria-00524401/PDF/Sturm-cvpr05.pdf
