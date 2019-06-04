@@ -1,5 +1,5 @@
-To install:
+#### To install:
 	python setup.py install --user
 
-To use:
+#### To use:
 	take a look at example.ipynb
